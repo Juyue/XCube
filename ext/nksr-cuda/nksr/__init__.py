@@ -286,8 +286,8 @@ class Reconstructor:
             depth=self.hparams.tree_depth,
             device=self.device
         )
-        svh.build_point_splatting(xyz)
-        feat = self.network.encoder(xyz, feat, svh, 0)
+        svh.build_point_splatting(xyz) # build the svh grid
+        feat = self.network.encoder(xyz, feat, svh, 0) # feat: (N, 32), at level 0 (finest level)
         feat, svh, udf_svh = self.network.unet(
             feat, svh,
             adaptive_depth=self.hparams.adaptive_depth

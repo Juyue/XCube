@@ -72,3 +72,10 @@ def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
     else:
         out.div_(count, rounding_mode='floor')
     return out
+
+def scatter_std(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
+                 out: Optional[torch.Tensor] = None,
+                 dim_size: Optional[int] = None) -> torch.Tensor:
+    mean = scatter_mean(src, index, dim, out, dim_size)
+    std = scatter_mean((src - mean) ** 2, index, dim, out, dim_size)
+    return std

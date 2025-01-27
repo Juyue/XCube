@@ -25,7 +25,16 @@ from nksr.scatter import scatter_sum
 
 class QGMatrix:
     """ Used to hold pre-computed Q&G matrices: row->pts, col->vx """
-    def __init__(self, values: torch.Tensor, indexer: torch.Tensor, grid: GridBatch):
+    # def __init__(self, values: torch.Tensor, indexer: torch.Tensor, grid: GridBatch):
+    def __init__(self, values_jagged: JaggedTensor, indexer_jagged: JaggedTensor, grid: GridBatch):
+        # NOTE on change: values and indexers needs to be JaggedTensor
+        if isinstance(values_jagged, JaggedTensor):
+            values = values_jagged.jdata
+            indexer = indexer_jagged.jdata
+        else:
+            values = values_jagged
+            indexer = indexer_jagged
+
         assert values.size(0) == indexer.size(0)
         assert values.size(1) == indexer.size(1) == 27
 
@@ -36,22 +45,35 @@ class QGMatrix:
         # Compress matrix (also indices using 32-bit)
         pts_inds, vx_local_inds = torch.where(indexer != -1)
         vx_inds = indexer[pts_inds, vx_local_inds]
-        self.values = values[pts_inds, vx_local_inds]
-        self.row_ptr = sparse_solve.ind2ptr(pts_inds, self.n_row).int()
-        self.col_inds = vx_inds
+
+        self.values = JaggedTensor(values[pts_inds, vx_local_inds])
+        self.row_ptr = JaggedTensor(sparse_solve.ind2ptr(pts_inds, self.n_row).int())
+        self.col_inds = JaggedTensor(vx_inds)
 
     def transposed_vecmul(self, target: torch.Tensor):
-        row_inds = sparse_solve.ptr2ind(self.row_ptr, self.col_inds.size(0)).long()
+        if isinstance(target, JaggedTensor):
+            target = target.jdata
+        row_ptr = self.row_ptr.jdata if isinstance(self.row_ptr, JaggedTensor) else self.row_ptr
+        col_inds = self.col_inds.jdata if isinstance(self.col_inds, JaggedTensor) else self.col_inds
+        row_inds = sparse_solve.ptr2ind(row_ptr, col_inds.size(0)).long()
+        values = self.values.jdata if isinstance(self.values, JaggedTensor) else self.values
+
         return scatter_sum(
-            torch.sum(target[row_inds] * self.values, dim=1),
-            self.col_inds.long(), dim_size=self.n_col
+            torch.sum(target[row_inds] * values, dim=1),
+            col_inds.long(), dim_size=self.n_col
         )
 
     @classmethod
-    def adjoint_matmul(cls, lhs: "QGMatrix", rhs: "QGMatrix", out_indexer: torch.Tensor, num_entries: int):
+    def adjoint_matmul(cls, lhs: "QGMatrix", rhs: "QGMatrix", out_indexer: JaggedTensor, num_entries: JaggedTensor):
+        lhs_active_grid_coords = lhs.grid.grid_to_world(lhs.grid.ijk.float())
+        rhs_active_grid_coords = rhs.grid.grid_to_world(rhs.grid.ijk.float())
+        
         return kernel_eval.csr_matrix_multiplication(
-            lhs.grid._grid, rhs.grid._grid,
-            lhs.grid.active_grid_coords(), rhs.grid.active_grid_coords(),
+            # lhs.grid._grid, rhs.grid._grid,
+            lhs.grid, rhs.grid,
+            # lhs.grid.active_grid_coords(), rhs.grid.active_grid_coords(),
+            # lhs_active_grid_coords, rhs_active_grid_coords,
+            lhs.grid.ijk.long(), rhs.grid.ijk.long(),
             lhs.values, rhs.values,
             lhs.row_ptr, rhs.row_ptr,
             lhs.col_inds, rhs.col_inds,
@@ -104,7 +126,10 @@ class KernelField(BaseField):
         grid = self.svh.grids[depth]
 
         do_compute_grad = grad and not self.approx_kernel_grad
+        # interpolator is a mlp that takes feature
         if self.interpolator is not None:
+            # (grid, self.features[depth]) 
+            # (xyz, interp_res)
             interp_res = self.interpolator[str(depth)].interpolate(
                 xyz, grid, self.features[depth], do_compute_grad)
         else:
@@ -145,18 +170,18 @@ class KernelField(BaseField):
             f = f + f_depth
         return f
 
-    def solve_non_fused(self, pos_xyz: torch.Tensor, normal_xyz: torch.Tensor, normal_value: torch.Tensor,
+    def solve_non_fused(self, pos_xyz: JaggedTensor, normal_xyz: JaggedTensor, normal_value: JaggedTensor,
                         pos_weight: float = 1.0, normal_weight: float = 1.0, reg_weight: float = 0.0):
 
         assert pos_weight > 0.0 and normal_weight > 0.0, "data weights have to be >0!"
-        assert normal_xyz.size(0) == normal_value.size(0)
+        assert normal_xyz.jdata.size(0) == normal_value.jdata.size(0)
 
         self.solutions = {}
         grids = self.svh.grids
 
         # Evaluate kernels at custom positions
-        pos_kernel = {d: self.evaluate_kernel(pos_xyz, d) for d in range(self.svh.depth)}
-        normal_kernel = {d: self.evaluate_kernel(normal_xyz, d, True) for d in range(self.svh.depth)}
+        pos_kernel = {d: self.evaluate_kernel(pos_xyz, d) for d in range(self.svh.depth)} # (pos_xyz, corresponding feature)
+        normal_kernel = {d: self.evaluate_kernel(normal_xyz, d, True) for d in range(self.svh.depth)} # (normal_xyz, corresponding grad)
 
         # Pre-build Q and G matrices
         q_matrices, g_matrices = {}, {}
@@ -165,13 +190,15 @@ class KernelField(BaseField):
                 continue
 
             g_value, g_indexer = kernel_eval.qg_building(
-                grids[d]._grid, pos_xyz,
+                # grids[d]._grid, pos_xyz,
+                grids[d], pos_xyz,
                 pos_kernel[d], self.grid_kernel[d],
-                torch.zeros((0, 0, 3), **self.torch_kwargs), False)
+                JaggedTensor([torch.zeros((0, 0, 3), **self.torch_kwargs)]), False)
             g_matrices[d] = QGMatrix(g_value, g_indexer, grids[d])
 
             q_value, q_indexer = kernel_eval.qg_building(
-                grids[d]._grid, normal_xyz,
+                # grids[d]._grid, normal_xyz,
+                grids[d], normal_xyz,
                 normal_kernel[d][0], self.grid_kernel[d],
                 normal_kernel[d][1], True)
             q_matrices[d] = QGMatrix(q_value, q_indexer, grids[d])
@@ -188,7 +215,10 @@ class KernelField(BaseField):
                 if grids[dd] is None:
                     continue
 
-                mat_indexer = kernel_eval.build_coo_indexer(grids[d]._grid, grids[dd]._grid)
+                # mat_indexer = kernel_eval.build_coo_indexer(grids[d]._grid, grids[dd]._grid)
+                mat_indexer = kernel_eval.build_coo_indexer(grids[d], grids[dd])
+                if isinstance(mat_indexer, JaggedTensor):
+                    mat_indexer = mat_indexer.jdata
 
                 with exp.pt_profile_named("mat-indexer"):
                     d_inds, dd_local_inds = torch.where(mat_indexer != -1)
@@ -199,18 +229,22 @@ class KernelField(BaseField):
                         d_inds.size(0), device=self.svh.device, dtype=mat_indexer_type)
                     del dd_local_inds
                     d_inds = d_inds.int()
+                
+                mat_indexer = JaggedTensor(mat_indexer)
+                d_inds_size = JaggedTensor(torch.tensor([d_inds.size(0)], dtype=torch.int32))
 
                 gtg = QGMatrix.adjoint_matmul(
-                    g_matrices[d], g_matrices[dd], mat_indexer, d_inds.size(0)
+                    g_matrices[d], g_matrices[dd], mat_indexer, d_inds_size
                 )
                 qtq = QGMatrix.adjoint_matmul(
-                    q_matrices[d], q_matrices[dd], mat_indexer, d_inds.size(0)
+                    q_matrices[d], q_matrices[dd], mat_indexer, d_inds_size
                 )
 
                 lhs = pos_weight * gtg + normal_weight * qtq
                 if d == dd and reg_weight > 0.0:
                     lhs += reg_weight * kernel_eval.k_building(
-                        grids[d]._grid, self.grid_kernel[d], mat_indexer, d_inds.size(0)
+                        # grids[d]._grid, self.grid_kernel[d], mat_indexer, d_inds.size(0)
+                        grids[d], self.grid_kernel[d], mat_indexer, d_inds.size(0)
                     )[0]
                 lhs_mat.add_block(
                     d, dd, grids[d].num_voxels, grids[dd].num_voxels,
